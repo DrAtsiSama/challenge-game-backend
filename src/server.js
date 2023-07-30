@@ -71,7 +71,7 @@ app.use("/history", HistoryRouter());
 app.use("/stats", StatsRouter());
 
 app.use("/", (req, res) => {
-	res.send("Hello World!");
+  res.send("Hello World!");
 });
 
 app.use(errorsHandler);

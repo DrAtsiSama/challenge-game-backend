@@ -1,29 +1,36 @@
 const SecurityService = require("../services/security.service");
 const GameService = require("../services/game.service");
+const GameStatsService = require("../services/gameStats.service");
 const { WS_GAME_NAMESPACE } = require("../utils/constants");
+const QUESTION_TIME_LIMIT = 15;
 
-module.exports = function (io) {
-  const gameService = GameService();
-  const securityService = SecurityService();
+class GameServer {
+  constructor(io) {
+    this.io = io;
+    this.gameStatsService = GameStatsService();
+    this.gameService = GameService();
+    this.securityService = SecurityService();
+    this.namespace = this.io.of(WS_GAME_NAMESPACE);
+    this.gameStatuses = new Map();
+    this.remainingTimes = new Map();
+    this.activeConnections = new Map();
+    this.namespace.on("connection", this.handleConnection.bind(this));
+  }
 
-  const namespace = io.of(WS_GAME_NAMESPACE);
-
-  const gameStatuses = new Map();
-  const remainingTimes = new Map();
-
-  const getRemainingTime = (gameId) => {
-    const remaining = remainingTimes.get(gameId);
+  getRemainingTime(gameId) {
+    const remaining = this.remainingTimes.get(gameId);
     console.log(`Getting remaining time for game ${gameId}:`, remaining);
     return remaining;
-  };
+  }
 
-  const decrementRemainingTime = (gameId) => {
-    if (remainingTimes.has(gameId)) {
-      remainingTimes.set(gameId, remainingTimes.get(gameId) - 1);
+  decrementRemainingTime(gameId) {
+    if (this.remainingTimes.has(gameId)) {
+      this.remainingTimes.set(gameId, this.remainingTimes.get(gameId) - 1);
     }
-  };
+  }
 
-  const startGame = async (game) => {
+  async startGame(game) {
+    ///test plus rapide
     const allQuizzes = [
       {
         id: 1,
@@ -66,190 +73,234 @@ module.exports = function (io) {
         anecdote:
           "Didier Barbelivien, Michel Fugain et Danyel Gérard ont fait partie de la liste des artistes qui ont composé pour Hervé Vilard.",
       },
-      {
-        id: 5,
-        question:
-          "Quel peintre, né en 1844, est également appelé par beaucoup le Douanier ?",
-        propositions: [
-          "Henri Rousseau",
-          "Salvador Dali",
-          "Pablo Picasso",
-          "Edgar Degas",
-        ],
-        answer: "Henri Rousseau",
-        anecdote:
-          "Le premier portrait connu réalisé par le peintre Henri Rousseau semble être celui de sa première femme.",
-      },
-      {
-        id: 6,
-        question:
-          "Quel personnage imaginaire fut popularisé par le roman de E.R. Burroughs et par le cinéma ?",
-        propositions: ["Nessie", "Le Yéti", "King-Kong", "Tarzan"],
-        answer: "Tarzan",
-        anecdote:
-          "Edgar Rice Burroughs a inspiré bon nombre d'auteurs de science-fiction et de fantastique ainsi que de nombreux réalisateurs.",
-      },
-      {
-        id: 7,
-        question:
-          "Quelle est la seule valeur à la roulette à porter la couleur verte ?",
-        propositions: ["Treize", "Cinquante", "Zéro", "Quarante"],
-        answer: "Zéro",
-        anecdote:
-          "À la roulette, lorsque le croupier donne la main, chaque joueur mise sur un numéro qu'il espère être tiré pour remporter la mise.",
-      },
     ];
-
     console.log("Starting game", game._id);
-    if (gameStatuses.get(game._id)) return;
-    gameStatuses.set(game._id, true);
-    remainingTimes.set(game._id, 15);
+    if (this.gameStatuses.get(game._id)) return;
+    this.gameStatuses.set(game._id, true);
+    this.remainingTimes.set(game._id, QUESTION_TIME_LIMIT);
     console.log(
       "Set remaining time for game",
       game._id,
       ":",
-      remainingTimes.get(game._id)
+      this.remainingTimes.get(game._id)
     );
 
-    if (remainingTimes.get(game._id) === undefined) {
+    if (this.remainingTimes.get(game._id) === undefined) {
       console.error("Could not set remaining time for game", game._id);
     }
 
-    const firstQuestion = await gameService.setCurrentQuestion(
+    const firstQuestion = await this.gameService.setCurrentQuestion(
       game._id,
       allQuizzes[0]
     );
-    namespace.to(game._id).emit("question", firstQuestion);
+    this.namespace.to(game._id).emit("question", firstQuestion);
 
     let questionIndex = 1;
 
     const interval = setInterval(async () => {
       try {
-        decrementRemainingTime(game._id);
-        const remainingTime = getRemainingTime(game._id);
-        namespace.to(game._id).emit("remaining_time", remainingTime);
+        if (!this.activeConnections.has(game._id)) {
+          console.log(
+            `No active connections for game ${game._id}. Not getting remaining time.`
+          );
+          clearInterval(interval);
+          return;
+        }
+        this.decrementRemainingTime(game._id);
+        const remainingTime = this.getRemainingTime(game._id);
+        this.namespace.to(game._id).emit("remaining_time", remainingTime);
 
         if (remainingTime <= 0) {
           if (questionIndex < allQuizzes.length) {
-            remainingTimes.set(game._id, 15); // Reset the remaining time to 15
+            this.remainingTimes.set(game._id, QUESTION_TIME_LIMIT);
             const questionData = {
               ...allQuizzes[questionIndex],
-              remainingTime: getRemainingTime(game._id),
+              remainingTime: this.getRemainingTime(game._id),
             };
-            const currentQuestion = await gameService.setCurrentQuestion(
+            const currentQuestion = await this.gameService.setCurrentQuestion(
               game._id,
               questionData
             );
-            namespace.to(game._id).emit("question", currentQuestion);
+            this.namespace.to(game._id).emit("question", currentQuestion);
             questionIndex += 1;
           } else {
             clearInterval(interval);
-            const winner = await Promise.race([
-              gameService.getWinner(game._id),
-              new Promise((_, reject) =>
-                setTimeout(
-                  () => reject(new Error("Getting winner took too long")),
-                  1000
-                )
-              ),
-            ]);
-            namespace.to(game._id).emit("game_over", winner);
+
+            const alivePlayers = await this.gameService.getAlivePlayers(
+              game._id
+            );
+            console.log("aliveplayer", alivePlayers);
+            if (alivePlayers.length <= 0) {
+              const winners = await this.gameService.getWinner(game._id);
+              console.log("voici le score end game", winners);
+              this.namespace.to(game._id).emit("game_over", winners);
+            }
           }
         }
       } catch (err) {
         console.error(err);
         clearInterval(interval);
       }
-    }, 1000); // changed this from 15*1000 to 1000 for every second emit.
+    }, 1000);
+    this.namespace
+      .to(game._id)
+      .emit("remaining_time", this.getRemainingTime(game._id));
+  }
 
-    namespace.to(game._id).emit("remaining_time", getRemainingTime(game._id));
-  };
-
-  const handleConnection = async (socket) => {
+  async handleConnection(socket) {
     const code = socket.handshake.query["code"];
     const { token } = socket.handshake.auth;
-    const user = await securityService.getUserFromToken(token);
-    const game = await gameService.findOneByCode(code);
+    const user = await this.securityService.getUserFromToken(token);
+    const game = await this.gameService.findOneByCode(code);
 
     if (!game) return;
-    if (game.isStarted) {
-      const currentQuestion = await gameService.getCurrentQuestion(game._id);
-      socket.emit("question", currentQuestion);
+    if (!this.activeConnections.has(game._id)) {
+      this.activeConnections.set(game._id, new Set());
+    }
+    this.activeConnections.get(game._id).add(user._id);
+    const players = await this.gameService.addPlayer(game._id, user);
 
-      // Emit the remaining time immediately after the socket connects
-      socket.emit("remaining_time", getRemainingTime(game._id));
-    }
-    const players = await gameService.addPlayer(game._id, user);
-    if (!game.isStarted && !gameStatuses.get(game._id)) {
-      await gameService.startGame(game._id);
-      startGame(game);
-    }
     socket.join(game._id);
 
-    namespace.to(game._id).emit("notification", {
+    this.namespace.to(game._id).emit("notification", {
       title: "Someone's here",
       description: `${user.username} just joined the game`,
     });
-    namespace.to(game._id).emit("players", players);
+
+    this.namespace.to(game._id).emit("players", players);
 
     if (game.isStarted) {
-      const currentQuestion = await gameService.getCurrentQuestion(game._id);
+      const currentQuestion = await this.gameService.getCurrentQuestion(
+        game._id
+      );
       socket.emit("question", currentQuestion);
-
-      socket.emit("remaining_time", getRemainingTime(game._id));
+      socket.emit("remaining_time", this.getRemainingTime(game._id));
+    } else if (!this.gameStatuses.get(game._id)) {
+      await this.gameService.startGame(game._id);
+      this.startGame(game);
     }
 
     socket.on("answer", async ({ questionId, answer }) => {
       try {
-        const isCorrect = await gameService.checkAnswer(
+        const isCorrect = await this.gameService.checkAnswer(
           game._id,
           questionId,
           answer
         );
+        const respondedQuickly = this.getRemainingTime(game._id) > 10;
+
         if (isCorrect) {
-          await gameService.incrementScore(game._id, user._id);
+          await this.gameService.incrementScore(
+            game._id,
+            user._id,
+            respondedQuickly
+          );
+          const updatedGame = await this.gameService.incrementScore(
+            game._id,
+            user._id,
+            respondedQuickly
+          );
+
+          if (updatedGame.players && updatedGame.players.length > 0) {
+            const updatedPlayer = updatedGame.players.find(
+              (player) => player.id === user._id
+            );
+
+            if (updatedPlayer) {
+              const updatedScore = updatedPlayer.score;
+              this.namespace.to(game._id).emit("score_updated", {
+                playerId: user._id,
+                score: updatedScore,
+              });
+            } else {
+              console.error("Player not found in updatedGame:", user._id);
+            }
+          } else {
+            console.error("No players or empty players array in updatedGame");
+          }
         } else {
-          await gameService.decrementLives(game._id, user._id);
-          const lives = await gameService.getLives(game._id, user._id);
+          await this.gameService.decrementLives(game._id, user._id);
+          const lives = await this.gameService.getLives(game._id, user._id);
           if (lives === 0) {
             socket.emit("eliminated");
             socket.leave(game._id);
-            await gameService.eliminatePlayer(game._id, user._id);
-            namespace.to(game._id).emit("player_eliminated", user.username);
+            await this.gameService.eliminatePlayer(game._id, user._id);
+            this.namespace
+              .to(game._id)
+              .emit("player_eliminated", user.username);
           }
         }
       } catch (error) {
         console.error("Error while processing answer:", error);
       }
-      if (game.players.length === 0) {
-        gameStatuses.set(game._id, false);
+
+      if (game && game.players.length === 0) {
+        this.gameStatuses.set(game._id, false);
       }
     });
-
     socket.on("reconnect", async () => {
       if (game.isStarted) {
         const currentQuestionData = {
-          ...(await gameService.getCurrentQuestion(game._id)),
-          remainingTime: getRemainingTime(game._id),
+          ...(await this.gameService.getCurrentQuestion(game._id)),
+          remainingTime: this.getRemainingTime(game._id),
         };
         socket.emit("question", currentQuestionData);
-
-        socket.emit("remaining_time", getRemainingTime(game._id));
+        console.log(currentQuestionData);
+        socket.emit("remaining_time", this.getRemainingTime(game._id));
+        const currentScore = await this.gameService.getCurrentScore(
+          game._id,
+          user._id
+        );
+        socket.emit("score", currentScore);
       }
     });
-
     socket.on("disconnect", async () => {
-      const players = await gameService.removePlayer(game._id, user._id);
-      namespace.to(game._id).emit("players", players);
-      namespace.to(game._id).emit("notification", {
-        title: "Someone just left",
-        description: `${user.username} just left the game`,
-      });
-      if (game.players.length === 0) {
-        gameStatuses.set(game._id, false);
+      try {
+        if (this.activeConnections.has(game._id)) {
+          this.activeConnections.get(game._id).delete(user._id);
+          if (this.activeConnections.get(game._id).size === 0) {
+            this.activeConnections.delete(game._id);
+          }
+        }
+        const players = await this.gameService.removePlayer(game._id, user._id);
+        this.namespace.to(game._id).emit("players", players);
+        this.namespace.to(game._id).emit("notification", {
+          title: "Someone just left",
+          description: `${user.username} just left the game`,
+        });
+        if (players.length === 0) {
+          const sortedPlayers = await this.gameService.sortPlayersByScore(
+            game._id
+          );
+          console.log(sortedPlayers);
+          const rankedPlayers = await this.gameService.rankPlayers(
+            sortedPlayers
+          );
+          const gameStatsData = {
+            stats: rankedPlayers.map((player) => ({
+              user: {
+                id: player.id,
+                username: player.username,
+              },
+              rank: player.rank,
+              score: player.score,
+              lives: player.lives,
+            })),
+          };
+          const savedStats = await this.gameStatsService.create(gameStatsData);
+          console.log("Game statistics saved successfully:", savedStats);
+          this.gameStatuses.delete(game._id);
+
+          console.log("Alive Players:", alivePlayers);
+          console.log("Game Statistics:", stats);
+        }
+      } catch (error) {
+        console.error("Error handling disconnect:", error);
       }
     });
-  };
+  }
+}
 
-  namespace.on("connection", handleConnection);
+module.exports = function (io) {
+  new GameServer(io);
 };
